@@ -10,13 +10,17 @@
 #   - le esecuzioni fallite o interrotte (vLLM non partito, gradini mancanti);
 #   - le esecuzioni complete ma rifatte piu' tardi con la stessa configurazione;
 #   - i file inputs.json di AIPerf: il dataset inviato al server, di solito il
-#     file piu' pesante, rigenerabile con lo stesso seed e inutile all'analisi.
-# Un'esecuzione e' completa se per ogni benchmark AIPerf ha scritto un
-# profile_export_aiperf.json per ogni gradino di utenti indicato nel suo log.
+#     file piu' pesante (~1 GB per gradino con qwen e glm), rigenerabile con lo
+#     stesso seed e inutile all'analisi.
+# Un'esecuzione e' completa se ogni gradino avviato da AIPerf e' arrivato in
+# fondo (.aiperf_results_ready.json) e, quando si sa quanti gradini erano
+# previsti (parametri.txt o run_config.json), li ha fatti tutti.
+# Nella colonna STATO "3/?" vuol dire 3 gradini finiti su un totale non noto:
+# confrontarlo con gli utenti previsti dal test.
 #
 # Variabili facoltative:
-#   LEGGERO=1  esclude anche i *.jsonl (dati grezzi per singola richiesta,
-#              telemetria GPU e metriche vLLM campionate): restano riepiloghi,
+#   LEGGERO=1  esclude anche i *.jsonl (dati grezzi per singola richiesta e
+#              telemetria GPU campionata, ~16 MB per gradino): restano riepiloghi,
 #              csv, fette da 60 s e log. Senza i jsonl non si possono piu'
 #              ricalcolare metriche per turno o per lunghezza del contesto.
 #   TUTTE=1    include tutte le esecuzioni complete, non solo l'ultima.
@@ -34,24 +38,61 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 EXCL=(--exclude=inputs.json)
 [[ "${LEGGERO:-0}" == "1" ]] && EXCL+=(--exclude='*.jsonl')
 
+# Gradini previsti per un benchmark (cartella aiperf/<profilo>/<etichetta>/<ora>):
+# da parametri.txt (scritto da benchmark_aiperf.sh dal 18/11/2026), altrimenti
+# dalla lista di concurrency in run_config.json di AIPerf. Vuoto se non si sa.
+gradini_attesi() {
+  local d="$1" users rc
+  users=$(cat "$d/parametri.txt" 2>/dev/null \
+    | sed -n 's/^Utenti per gradino: \([0-9,]*\), [0-9]* s per gradino.*/\1/p' | head -1 || true)
+  if [[ -n "$users" ]]; then awk -F, '{print NF}' <<< "$users"; return; fi
+  rc=$(find "$d" -mindepth 1 -maxdepth 2 -name run_config.json | head -1 || true)
+  [[ -n "$rc" ]] || return 0
+  python3 - "$rc" <<'PY' 2>/dev/null || true
+import json, sys
+def walk(o):
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if "concurrency" in k.lower() and isinstance(v, list) and v and all(isinstance(x, int) for x in v):
+                yield len(v)
+            yield from walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from walk(v)
+n = list(walk(json.load(open(sys.argv[1]))))
+if n:
+    print(max(n))
+PY
+}
+
 # Stato di una configurazione: OK, oppure il motivo per cui non e' completa.
+# AIPerf crea una cartella concurrency_N per gradino e ci scrive
+# .aiperf_results_ready.json solo quando il gradino e' finito.
 stato() {
-  local dir="$1" log users attesi trovati n=0 msg=""
+  local dir="$1" b avviati finiti attesi n=0 msg="" ok=""
   if grep -qs "non e' partito" "$dir/tempi.txt"; then echo "FALLITA (vLLM non partito)"; return; fi
   if [[ -d "$dir/aiperf" ]]; then
-    while IFS= read -r log; do
+    while IFS= read -r b; do
       n=$((n + 1))
-      users=$(sed -n 's/^Utenti per gradino: \([0-9,]*\), [0-9]* s per gradino.*/\1/p' "$log" | head -1)
-      attesi=$(awk -F, '{print NF}' <<< "$users")
-      trovati=$(find "$(dirname "$log")" -name profile_export_aiperf.json | wc -l)
-      if [[ -z "$users" ]] || (( trovati < attesi )); then
-        msg+=" $(basename "$(dirname "$(dirname "$log")")") ${trovati}/${attesi:-?}"
+      avviati=$(find "$b" -mindepth 1 -maxdepth 1 -type d -name 'concurrency_*' | wc -l)
+      if (( avviati > 0 )); then
+        finiti=$(find "$b" -mindepth 2 -maxdepth 2 -path '*/concurrency_*/.aiperf_results_ready.json' | wc -l)
+      else   # un solo valore di utenti: AIPerf potrebbe non creare sottocartelle
+        avviati=1
+        finiti=$(find "$b" -maxdepth 1 \( -name .aiperf_results_ready.json -o -name profile_export_aiperf.json \) | head -1 | wc -l)
       fi
-    done < <(find "$dir/aiperf" -mindepth 4 -maxdepth 4 -name aiperf.log | sort)
+      attesi=$(gradini_attesi "$b")
+      local et; et=$(basename "$(dirname "$b")")
+      if (( finiti < avviati )) || { [[ -n "$attesi" ]] && (( finiti < attesi )); }; then
+        msg+=" $et ${finiti}/${attesi:-$avviati+}"
+      else
+        ok+=" ${finiti}/${attesi:-?}"
+      fi
+    done < <(find "$dir/aiperf" -mindepth 3 -maxdepth 3 -type d | sort)
   fi
   if (( n == 0 )); then echo "FALLITA (nessun benchmark)"
-  elif [[ -n "$msg" ]]; then echo "INCOMPLETA (gradini:$msg)"
-  else echo "OK"; fi
+  elif [[ -n "$msg" ]]; then echo "INCOMPLETA (gradini finiti:$msg)"
+  else echo "OK (gradini:$ok)"; fi
 }
 
 # 1. Tutte le configurazioni di tutte le esecuzioni.
@@ -81,7 +122,7 @@ done
 #    piu' le cartelle indicate in FORZA.
 sort -t$'\t' -k1,1 -k2,2r "$TMP/tutte" | awk -F'\t' -v tutte="${TUTTE:-0}" -v forza=" ${FORZA:-} " '
   { sel = 0
-    if ($4 == "OK" && (tutte == "1" || !($1 in presa))) { sel = 1; presa[$1] = 1 }
+    if ($4 ~ /^OK/ && (tutte == "1" || !($1 in presa))) { sel = 1; presa[$1] = 1 }
     if (index(forza, " " $3 " ") || index(forza, " " $3 "/ ")) sel = 1
     split($3, p, "/"); stampdir = p[1] "/" p[2] "/" p[3]
     print sel "\t" stampdir "\t" $0 }' > "$TMP/scelte"
