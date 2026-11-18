@@ -5,10 +5,10 @@
 #   ./comune/raccogli-risultati.sh            # solo elenco: stato e peso di ogni esecuzione
 #   ./comune/raccogli-risultati.sh archivio   # crea risultati-<host>-<data>.tar.gz
 #
-# Per ogni test e configurazione (es. test 8 "tp4", test 13 una variante)
-# nell'archivio entra solo l'ultima esecuzione completa. Restano fuori:
+# Nell'archivio entrano le esecuzioni complete di ogni test e configurazione
+# (es. test 8 "tp4", test 13 una variante). Restano fuori:
 #   - le esecuzioni fallite o interrotte (vLLM non partito, gradini mancanti);
-#   - le esecuzioni complete ma rifatte piu' tardi con la stessa configurazione;
+#   - con TUTTE=0, le esecuzioni complete rifatte piu' tardi con la stessa configurazione;
 #   - i file inputs.json di AIPerf: il dataset inviato al server, di solito il
 #     file piu' pesante (~1 GB per gradino con qwen e glm), rigenerabile con lo
 #     stesso seed e inutile all'analisi.
@@ -23,7 +23,10 @@
 #              telemetria GPU campionata, ~16 MB per gradino): restano riepiloghi,
 #              csv, fette da 60 s e log. Senza i jsonl non si possono piu'
 #              ricalcolare metriche per turno o per lunghezza del contesto.
-#   TUTTE=1    include tutte le esecuzioni complete, non solo l'ultima.
+#   TUTTE=1    (predefinito) include tutte le esecuzioni complete.
+#   TUTTE=0    solo l'ultima esecuzione completa di ogni configurazione.
+#   TUTTE="test-03 test-10"   tutte per i test indicati, l'ultima per gli altri
+#              (basta l'inizio del nome della cartella del test).
 #   FORZA="test-19-guasti-glm/risultati/20261117-101500 ..."
 #              include comunque queste cartelle anche se incomplete
 #              (es. un test di guasto in cui AIPerf si e' interrotto).
@@ -120,11 +123,14 @@ done
 
 # 2. Scelta: l'ultima esecuzione OK per configurazione (o tutte con TUTTE=1),
 #    piu' le cartelle indicate in FORZA.
-sort -t$'\t' -k1,1 -k2,2r "$TMP/tutte" | awk -F'\t' -v tutte="${TUTTE:-0}" -v forza=" ${FORZA:-} " '
+sort -t$'\t' -k1,1 -k2,2r "$TMP/tutte" | awk -F'\t' -v tutte="${TUTTE:-1}" -v forza=" ${FORZA:-} " '
   { sel = 0
-    if ($4 ~ /^OK/ && (tutte == "1" || !($1 in presa))) { sel = 1; presa[$1] = 1 }
-    if (index(forza, " " $3 " ") || index(forza, " " $3 "/ ")) sel = 1
     split($3, p, "/"); stampdir = p[1] "/" p[2] "/" p[3]
+    tutti_qui = (tutte == "1")
+    nt = split(tutte, t, /[ ,]+/)
+    for (i = 1; i <= nt; i++) if (t[i] != "" && t[i] != "1" && index(p[1], t[i]) == 1) tutti_qui = 1
+    if ($4 ~ /^OK/ && (tutti_qui || !($1 in presa))) { sel = 1; presa[$1] = 1 }
+    if (index(forza, " " $3 " ") || index(forza, " " $3 "/ ")) sel = 1
     print sel "\t" stampdir "\t" $0 }' > "$TMP/scelte"
 
 # 3. Elenco.
@@ -145,8 +151,16 @@ if [[ -s "$TMP/cartelle" ]]; then
   echo "Peso per tipo di file nelle esecuzioni scelte (prima della compressione):"
   while IFS= read -r d; do find "$d" -type f -printf '%s %f\n'; done < "$TMP/cartelle" \
     | sed -E 's/ vllm-test[^ ]*\./ <container>./; s/ (nginx|proxy|router)[^ ]*\.(log|conf)$/ <\1>.\2/' \
-    | awk '{ s[$2] += $1; n[$2]++ } END { for (f in s) printf "%10.1f MB %6d file  %s\n", s[f] / 1048576, n[f], f }' \
-    | sort -rn | head -20
+    | awk -v leggero="${LEGGERO:-0}" '
+        { s[$2] += $1; n[$2]++ }
+        END { for (f in s) {
+                fuori = (f == "inputs.json" || (leggero == "1" && f ~ /\.jsonl$/))
+                if (fuori) esclusi += s[f]; else tenuti += s[f]
+                printf "%10.1f MB %6d file  %s%s\n", s[f] / 1048576, n[f], f, fuori ? "   (ESCLUSO)" : "" }
+              printf "%10.1f MB  TOTALE NELL ARCHIVIO (prima della compressione)\n", tenuti / 1048576 > "/dev/stderr"
+              printf "%10.1f MB  TOTALE ESCLUSO\n", esclusi / 1048576 > "/dev/stderr" }' \
+    2> "$TMP/totali" | sort -rn | head -20
+  cat "$TMP/totali"
 fi
 
 [[ "$MODE" == "archivio" ]] || { echo; echo "Per creare l'archivio: $0 archivio"; exit 0; }
